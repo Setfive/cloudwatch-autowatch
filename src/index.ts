@@ -4,6 +4,7 @@
 import * as AWS from "aws-sdk";
 import * as _ from "lodash";
 import * as colors from "colors/safe";
+import * as Bluebird from "bluebird";
 import {Config} from "./config";
 import {Instance} from "aws-sdk/clients/ec2";
 import {PutMetricAlarmInput} from "aws-sdk/clients/cloudwatch";
@@ -12,17 +13,29 @@ class Main {
 
     private config : Config;
     private ec2 : AWS.EC2;
+    private rds : AWS.RDS;
     private cloudwatch : AWS.CloudWatch;
 
     public main() : void {
         this.config = Config.getConfig();
+
         this.ec2 = new AWS.EC2({region: this.config.region});
+        this.rds = new AWS.RDS({region: this.config.region});
         this.cloudwatch = new AWS.CloudWatch({region: this.config.region});
 
         if(!this.config.notificationArn){
             this.onFatalError("You must specify a notificationArn option for where to receive alerts.", "");
         }
 
+        this.getRdsInfo()
+            .then(results => {
+
+            })
+            .catch(err => {
+                this.onFatalError("Could not list RDS instances. Error was:", err);
+            });
+
+        /*
         this.getEc2Info()
             .then(results => {
                 const ec2Alarms = this.getEc2AlarmsForInstances(results);
@@ -31,6 +44,7 @@ class Main {
             .catch(err => {
                 this.onFatalError("Could not list EC2 instances. Error was:", err);
             });
+        */
     }
 
     private getEc2AlarmsForInstances(instances : Instance[]) : PutMetricAlarmInput[] {
@@ -44,7 +58,11 @@ class Main {
         const filteredInstances = _.filter(instances, f => f.InstanceId);
 
         const result = filteredInstances.map(f => {
-            const instanceId = f.InstanceId ? f.InstanceId : "";
+
+            if(!f.InstanceId){
+                throw "Null instanceId on EC2?";
+            }
+
             return [
                 {
                     ActionsEnabled: true,
@@ -56,7 +74,7 @@ class Main {
                     EvaluationPeriods: 1,
                     Threshold: 0,
                     Statistic: "Maximum",
-                    Dimensions: [{Name: "InstanceId", Value: instanceId}],
+                    Dimensions: [{Name: "InstanceId", Value: f.InstanceId}],
                     AlarmActions: [this.config.notificationArn]
                 },
                 {
@@ -69,7 +87,7 @@ class Main {
                     EvaluationPeriods: 5,
                     Threshold: 95,
                     Statistic: "Average",
-                    Dimensions: [{Name: "InstanceId", Value: instanceId}],
+                    Dimensions: [{Name: "InstanceId", Value: f.InstanceId}],
                     AlarmActions: [this.config.notificationArn]
                 },
                 {
@@ -82,7 +100,7 @@ class Main {
                     EvaluationPeriods: 5,
                     Threshold: 100,
                     Statistic: "Average",
-                    Dimensions: [{Name: "InstanceId", Value: instanceId}],
+                    Dimensions: [{Name: "InstanceId", Value: f.InstanceId}],
                     AlarmActions: [this.config.notificationArn]
                 }
             ]
@@ -110,6 +128,66 @@ class Main {
                 resolve(result);
             });
         });
+    }
+
+    private getTagsForRDSInstances(instances : AWS.RDS.DBInstance[]) : Promise<AWS.RDS.TagList[]> {
+
+        return new Promise<AWS.RDS.TagList[]>((resolve, reject) => {
+            Bluebird.map(instances, (item) => {
+                return new Promise<AWS.RDS.TagList>((resolveInstance, rejectInstance) => {
+                    if (!item.DBInstanceArn) {
+                        throw "RDS missing instance ARN?";
+                    }
+
+                    this.rds.listTagsForResource({ResourceName: item.DBInstanceArn}, (err, rdsData) => {
+                        if(err){
+                            return rejectInstance(err);
+                        }
+
+                        const res = rdsData.TagList ? rdsData.TagList : [];
+                        resolveInstance(res);
+                    });
+                });
+            }, {concurrency: 2})
+            .then(results => {
+                resolve(results);
+            })
+            .catch((err) => {
+                reject(err);
+            });
+        });
+
+    }
+
+    private getRdsInfo() : Promise<AWS.RDS.DBInstance[]> {
+
+        return new Promise<AWS.RDS.DBInstance[]>((resolve, reject) => {
+            this.rds.describeDBInstances((err, data) => {
+               if(err){
+                   return reject(err);
+               }
+
+               if(!data.DBInstances) {
+                   return resolve([]);
+               }
+
+               this.getTagsForRDSInstances(data.DBInstances)
+                   .then(tagResult => {
+                       const instancesAndTags = _.map(data.DBInstances, (item, index) => {
+                          return {Instance: item, Tags: tagResult[index]};
+                       });
+
+                       const instances = _.reject(instancesAndTags, f => {
+                           return _.find(f.Tags, fx => fx.Key == "SetfiveCloudAutoWatch" && fx.Value);
+                       });
+
+                       resolve(instances.map(f => f.Instance));
+                   })
+                   .catch(err => reject(err));
+               
+            });
+        });
+
     }
 
     private onFatalError(msg : string, error : any) : void {
