@@ -29,7 +29,8 @@ class Main {
 
         this.getRdsInfo()
             .then(results => {
-
+                const alarms = this.getRdsAlarmsForInstances(results);
+                console.log(alarms);
             })
             .catch(err => {
                 this.onFatalError("Could not list RDS instances. Error was:", err);
@@ -55,9 +56,7 @@ class Main {
          * Note: You can still run out of disk space on any of your volumes
          */
 
-        const filteredInstances = _.filter(instances, f => f.InstanceId);
-
-        const result = filteredInstances.map(f => {
+        const result = instances.map(f => {
 
             if(!f.InstanceId){
                 throw "Null instanceId on EC2?";
@@ -130,6 +129,65 @@ class Main {
         });
     }
 
+    private getRdsAlarmsForInstances(instances : AWS.RDS.DBInstance[]) : PutMetricAlarmInput[] {
+        /*
+        * CPUUtilization > 95% for 5 minute
+        * FreeStorageSpace < 1gb for 5 minute
+        * DiskQueueDepth > 100 for 5 minutes
+        */
+
+        const result = instances.map(f => {
+
+            if(!f.DBInstanceIdentifier){
+                throw "Null identifier on RDS?";
+            }
+
+            return [
+                {
+                    ActionsEnabled: true,
+                    AlarmName: "SetfiveCloudAutoWatch: CPU utilization over 95%",
+                    ComparisonOperator: "GreaterThanThreshold",
+                    MetricName: "CPUUtilization",
+                    Namespace: "AWS/RDS",
+                    Period: 60,
+                    EvaluationPeriods: 5,
+                    Threshold: 95,
+                    Statistic: "Average",
+                    Dimensions: [{Name: "DBInstanceIdentifier", Value: f.DBInstanceIdentifier}],
+                    AlarmActions: [this.config.notificationArn]
+                },
+                {
+                    ActionsEnabled: true,
+                    AlarmName: "SetfiveCloudAutoWatch: Storage space less than 1GB",
+                    ComparisonOperator: "LessThanThreshold",
+                    MetricName: "FreeStorageSpace",
+                    Namespace: "AWS/RDS",
+                    Period: 60,
+                    EvaluationPeriods: 5,
+                    Threshold: 1073741824,
+                    Statistic: "Average",
+                    Dimensions: [{Name: "DBInstanceIdentifier", Value: f.DBInstanceIdentifier}],
+                    AlarmActions: [this.config.notificationArn]
+                },
+                {
+                    ActionsEnabled: true,
+                    AlarmName: "SetfiveCloudAutoWatch: Query depth over 100",
+                    ComparisonOperator: "GreaterThanThreshold",
+                    MetricName: "DiskQueueDepth",
+                    Namespace: "AWS/RDS",
+                    Period: 60,
+                    EvaluationPeriods: 5,
+                    Threshold: 100,
+                    Statistic: "Average",
+                    Dimensions: [{Name: "DBInstanceIdentifier", Value: f.DBInstanceIdentifier}],
+                    AlarmActions: [this.config.notificationArn]
+                },
+            ]
+        });
+
+        return _.flatten(result);
+    }
+
     private getTagsForRDSInstances(instances : AWS.RDS.DBInstance[]) : Promise<AWS.RDS.TagList[]> {
 
         return new Promise<AWS.RDS.TagList[]>((resolve, reject) => {
@@ -184,7 +242,7 @@ class Main {
                        resolve(instances.map(f => f.Instance));
                    })
                    .catch(err => reject(err));
-               
+
             });
         });
 
