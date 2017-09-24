@@ -5,9 +5,11 @@ import * as AWS from "aws-sdk";
 import * as _ from "lodash";
 import * as colors from "colors/safe";
 import * as Bluebird from "bluebird";
+import * as moment from "moment";
 import {Config} from "./config";
 import {Instance} from "aws-sdk/clients/ec2";
 import {PutMetricAlarmInput} from "aws-sdk/clients/cloudwatch";
+import {ELBStatistics} from "./types";
 
 class Main {
 
@@ -295,6 +297,83 @@ class Main {
         return [];
     }
 
+    private getELBStatisticsForLoadbalancers(instances : AWS.ELBv2.LoadBalancer[]) : Promise<ELBStatistics[]> {
+
+        const startTime = moment().subtract("24", "hours").toDate();
+        const endTime = moment().toDate();
+
+        return new Promise<ELBStatistics[]>((resolve, reject) => {
+
+            Bluebird.map(instances, (instance) => {
+
+                if(!instance.LoadBalancerArn){
+                    throw "Missing ARN on load balancer?";
+                }
+
+                const arn = instance.LoadBalancerArn.split(":").pop();
+                if(!arn){
+                    throw "Missing name from ARN?";
+                }
+
+                const cloudwatchDimension = arn.replace("loadbalancer/", "");
+
+                const targetTime = new Promise<AWS.CloudWatch.Datapoint[]>((resolveInstance, rejectInstance) => {
+                    const params = {"Namespace": "AWS/ApplicationELB",
+                                    "MetricName": "TargetResponseTime",
+                                    "StartTime": startTime,
+                                    "EndTime": endTime,
+                                    "Period": 60,
+                                    "Statistics": ["Average"],
+                                    "Dimensions": [{"Name": "LoadBalancer", "Value": cloudwatchDimension}]
+                    };
+
+                    this.cloudwatch.getMetricStatistics(params, (err, response) => {
+                        if(err){
+                            return rejectInstance(err);
+                        }
+
+                        resolveInstance(response.Datapoints);
+                    });
+                });
+
+                const responseCount = new Promise<AWS.CloudWatch.Datapoint[]>((resolveInstance, rejectInstance) => {
+                    const params = {
+                        "Namespace": "AWS/ApplicationELB",
+                        "MetricName": "RequestCount",
+                        "StartTime": startTime,
+                        "EndTime": endTime,
+                        "Period": 60,
+                        "Statistics": ["Average"],
+                        "Dimensions": [{"Name": "LoadBalancer", "Value": cloudwatchDimension}]
+                    };
+
+                    this.cloudwatch.getMetricStatistics(params, (err, response) => {
+                        if (err) {
+                            return rejectInstance(err);
+                        }
+
+                        resolveInstance(response.Datapoints);
+                    });
+                });
+
+                return Bluebird.all([targetTime, responseCount])
+                               .then(results => {
+                                   return {LoadBalancerArn: instance.LoadBalancerArn,
+                                          TargetResponseTimes: results[0],
+                                          RequestCountCounts: results[1]};
+                               });
+
+            }, {concurrency: 2})
+            .then(results => {
+                resolve(<ELBStatistics[]> results);
+            })
+            .catch((err) => {
+                reject(err);
+            });
+
+        });
+    }
+
     private getELBInfo() : Promise<AWS.ELBv2.LoadBalancer[]> {
 
         return new Promise<AWS.ELBv2.LoadBalancer[]>((resolve, reject) => {
@@ -319,7 +398,12 @@ class Main {
                             return _.find(lbTags.Tags, fx => fx.Key == "SetfiveCloudAutoWatch" && fx.Value);
                         });
 
-                        resolve(targetInstances);
+                        this.getELBStatisticsForLoadbalancers(targetInstances)
+                            .then(instanceStats => {
+                                resolve(targetInstances);
+                            })
+                            .catch((err) => reject(err));
+
                     })
                     .catch((err) => reject(err));
             });
