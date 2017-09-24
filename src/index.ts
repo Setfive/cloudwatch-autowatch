@@ -14,6 +14,7 @@ class Main {
     private config : Config;
     private ec2 : AWS.EC2;
     private rds : AWS.RDS;
+    private elb : AWS.ELBv2;
     private cloudwatch : AWS.CloudWatch;
 
     public main() : void {
@@ -21,12 +22,21 @@ class Main {
 
         this.ec2 = new AWS.EC2({region: this.config.region});
         this.rds = new AWS.RDS({region: this.config.region});
+        this.elb = new AWS.ELBv2({region: this.config.region});
         this.cloudwatch = new AWS.CloudWatch({region: this.config.region});
 
         if(!this.config.notificationArn){
             this.onFatalError("You must specify a notificationArn option for where to receive alerts.", "");
         }
 
+        this.getELBInfo().then(results => {
+            console.log(JSON.stringify(results));
+        })
+        .catch(err => {
+            this.onFatalError("Could not list ELB instances. Error was:", err);
+        });
+
+        /*
         this.getRdsInfo()
             .then(results => {
                 const alarms = this.getRdsAlarmsForInstances(results);
@@ -36,7 +46,6 @@ class Main {
                 this.onFatalError("Could not list RDS instances. Error was:", err);
             });
 
-        /*
         this.getEc2Info()
             .then(results => {
                 const ec2Alarms = this.getEc2AlarmsForInstances(results);
@@ -243,6 +252,76 @@ class Main {
                    })
                    .catch(err => reject(err));
 
+            });
+        });
+
+    }
+
+    private getTagsForELBInstances(instances : AWS.ELBv2.LoadBalancer[]) : Promise<AWS.ELBv2.TagDescription[]> {
+
+        const chunkedArns = _.chunk(instances.map(f => f.LoadBalancerArn), 20);
+
+        return new Promise<AWS.ELBv2.TagDescription[]>((resolve, reject) => {
+            Bluebird.map(chunkedArns, (instanceArns) => {
+                return new Promise<AWS.ELBv2.TagDescription[]>((resolveInstance, rejectInstance) => {
+
+                    this.elb.describeTags({ResourceArns: <string[]> instanceArns}, (err, elbData) => {
+                        if (err) {
+                            return rejectInstance(err);
+                        }
+
+                        resolveInstance(elbData.TagDescriptions);
+                    });
+                });
+            }, {concurrency: 2})
+            .then(results => {
+                resolve(_.flatten(results));
+            })
+            .catch((err) => {
+                reject(err);
+            });
+        });
+
+    }
+
+    private getElbAlarmsForInstances(instances : AWS.ELB.LoadBalancerDescription[]) : PutMetricAlarmInput[] {
+        /**
+         * HTTPCode_Target_5XX_Count > 0 for 5 minutes
+         * TargetResponseTime > [max last 24 hrs] for 5 minutes
+         * RequestCount > [max last 24 hrs]
+         */
+
+
+        return [];
+    }
+
+    private getELBInfo() : Promise<AWS.ELBv2.LoadBalancer[]> {
+
+        return new Promise<AWS.ELBv2.LoadBalancer[]>((resolve, reject) => {
+            this.elb.describeLoadBalancers((err, data) => {
+
+                if(err){
+                    return reject(err);
+                }
+
+                if(!data.LoadBalancers || data.LoadBalancers.length == 0){
+                    return resolve([]);
+                }
+
+                this.getTagsForELBInstances(data.LoadBalancers)
+                    .then(tagData => {
+                        const targetInstances = _.reject(data.LoadBalancers, f => {
+                            const lbTags = _.find(tagData, td => td.ResourceArn == f.LoadBalancerArn);
+                            if(!lbTags){
+                                return false;
+                            }
+
+                            return _.find(lbTags.Tags, fx => fx.Key == "SetfiveCloudAutoWatch" && fx.Value);
+                        });
+
+                        resolve(targetInstances);
+                    })
+                    .catch((err) => reject(err));
             });
         });
 
