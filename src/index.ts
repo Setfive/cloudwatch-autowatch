@@ -9,7 +9,10 @@ import * as moment from "moment";
 import {Config} from "./config";
 import {Instance} from "aws-sdk/clients/ec2";
 import {PutMetricAlarmInput} from "aws-sdk/clients/cloudwatch";
-import {LoadBalancerWithStatistics} from "./types";
+import {CloudWatchTag, LoadBalancerWithStatistics} from "./types";
+
+process.stdin.resume();
+process.stdin.setEncoding('utf8');
 
 class Main {
 
@@ -42,9 +45,13 @@ class Main {
                default: throw "Unimplemented service: " + f;
            }
         })
+        .then(() => {
+            this.log("We're done. Exiting.");
+            process.exit(0);
+        })
         .catch(err => {
             this.onFatalError("Error processing alarms.", err);
-        })
+        });
 
         /*
         this.getELBInfo().then(results => {
@@ -55,16 +62,6 @@ class Main {
             this.onFatalError("Could not list ELB instances. Error was:", err);
         });
 
-
-        this.getRdsInfo()
-            .then(results => {
-                const alarms = this.getRdsAlarmsForInstances(results);
-                console.log(alarms);
-            })
-            .catch(err => {
-                this.onFatalError("Could not list RDS instances. Error was:", err);
-            });
-
         */
     }
 
@@ -74,10 +71,77 @@ class Main {
         });
     }
 
+    private tagRds(arn : string) : Promise<boolean> {
+        return new Promise<boolean>((resolve, reject) => {
+            this.rds.addTagsToResource({ResourceName: arn, Tags: this.getCloudWatchTag()}, (err, result) => {
+                if(err){
+                    return reject(err);
+                }
+
+                resolve(true);
+            });
+        });
+    }
+
     private handleRds() : Promise<boolean> {
         return new Promise<boolean>((resolve, reject) => {
-            resolve(true);
+
+            this.getRdsInfo()
+                .then(results => {
+                    const alarms = this.getRdsAlarmsForInstances(results);
+                    const arns = results.map(f => f.DBInstanceArn);
+
+                    this.log("Going to add the following RDS alarms and tag [" + (arns.join(", ")) + "]");
+                    this.prettyPrintAlarms(alarms);
+
+                    this.confirmActions().then((shouldApply) => {
+                        if(shouldApply) {
+                            this.applyCloudWatchAlarms(alarms)
+                                .then(() => {
+                                    Bluebird.each(arns, arn => this.tagRds(<string> arn))
+                                            .then(() => resolve(true))
+                                            .catch(err => reject(err));
+
+                                })
+                                .catch(err => {
+                                    reject(err);
+                                });
+                        }else{
+                            resolve(true);
+                        }
+                    });
+
+                })
+                .catch(err => {
+                    reject(err);
+                });
+
         });
+    }
+
+    private confirmActions() : Promise<boolean> {
+
+        return new Promise<boolean>((resolve, reject) => {
+            this.log("Continue? (Y = Yes, S = Skip, Or we'll quit)");
+
+            process.stdin.on('data', text => {
+
+                process.stdin.removeAllListeners("data");
+
+                text = text.trim();
+                if (text == "Y") {
+                    resolve(true);
+                }else if(text == "S"){
+                    this.log("Skipping...");
+                    resolve(false);
+                }else{
+                    this.log("Bailing per your request.");
+                    process.exit(-1);
+                }
+            });
+
+        });
+
     }
 
     private handleEc2(): Promise<boolean> {
@@ -87,24 +151,31 @@ class Main {
                 .then(results => {
                     const ec2Alarms = this.getEc2AlarmsForInstances(results);
                     const instanceIds = results.map(f => <string> f.InstanceId);
-                    const tagParams = {Resources: instanceIds, Tags: [{Key: "SetfiveCloudAutoWatch", Value: moment().toISOString()}]};
+                    const tagParams = {Resources: instanceIds, Tags: this.getCloudWatchTag()};
 
-                    /*
-                    this.applyCloudWatchAlarms(ec2Alarms)
-                        .then(() => {
-                        this.ec2.createTags(tagParams, (err, result) => {
-                            if(err){
-                                return reject(err);
-                            }
+                    this.log("Going to add the following EC2 alarms and tag [" + (instanceIds.join(", ")) + "]");
+                    this.prettyPrintAlarms(ec2Alarms);
 
+                    this.confirmActions().then((shouldApply) => {
+                        if(shouldApply) {
+                            this.applyCloudWatchAlarms(ec2Alarms)
+                                .then(() => {
+                                    this.ec2.createTags(tagParams, (err, result) => {
+                                        if (err) {
+                                            return reject(err);
+                                        }
+
+                                        resolve(true);
+                                    });
+                                })
+                                .catch(err => {
+                                    reject(err);
+                                });
+                        }else{
                             resolve(true);
-                        });
-                    })
-                    .catch(err => {
-                        reject(err);
+                        }
                     });
-                    */
-                    
+
                 })
                 .catch(err => {
                     reject(err);
@@ -191,6 +262,8 @@ class Main {
     }
 
     private getEc2Info() : Promise<Instance[]> {
+        this.log("Describing EC2 instances...");
+
         return new Promise<Instance[]>((resolve, reject) => {
             this.ec2.describeInstances((err, data) => {
                 if(err){
@@ -205,6 +278,11 @@ class Main {
                 const result : Instance[] = _.reject(instances, f => {
                    return _.find(f.Tags, f => f.Key == "SetfiveCloudAutoWatch" && f.Value);
                 });
+
+                this.log("Found " + result.length + " instances without SetfiveCloudAutoWatch tag.");
+                result.forEach(instance => {
+                    this.log("ID: " + instance.InstanceId);
+                })
 
                 resolve(result);
             });
@@ -300,6 +378,7 @@ class Main {
     }
 
     private getRdsInfo() : Promise<AWS.RDS.DBInstance[]> {
+        this.log("Describing RDS instances...");
 
         return new Promise<AWS.RDS.DBInstance[]>((resolve, reject) => {
             this.rds.describeDBInstances((err, data) => {
@@ -319,6 +398,11 @@ class Main {
 
                        const instances = _.reject(instancesAndTags, f => {
                            return _.find(f.Tags, fx => fx.Key == "SetfiveCloudAutoWatch" && fx.Value);
+                       });
+
+                       this.log("Found " + instances.length + " without SetfiveCloudAutoWatch tag.");
+                       instances.forEach(instance => {
+                           this.log("ID: " + instance.Instance.DBInstanceArn);
                        });
 
                        resolve(instances.map(f => f.Instance));
@@ -542,6 +626,20 @@ class Main {
             });
         });
 
+    }
+
+    private getCloudWatchTag() : CloudWatchTag {
+        return [{Key: "SetfiveCloudAutoWatch", Value: moment().toISOString()}];
+    }
+
+    private prettyPrintAlarms(alarms : PutMetricAlarmInput[]) : void {
+        alarms.forEach(alarm => {
+            console.log(JSON.stringify(alarm, null, 2));
+        });
+    }
+
+    private log(msg : string) : void {
+        console.log(colors.gray(moment().toISOString()) + ": " + msg);
     }
 
     private onFatalError(msg : string, error : any) : void {

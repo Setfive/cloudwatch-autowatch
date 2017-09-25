@@ -5,3 +5,10 @@ export interface LoadBalancerWithStatistics {
     TargetResponseTimes: number[];
     RequestCountCounts: number[];
 }
+
+export type CloudWatchTag = Tag[];
+
+interface Tag {
+    Key : string;
+    Value : string;
+}
