@@ -53,21 +53,39 @@ class Main {
             this.onFatalError("Error processing alarms.", err);
         });
 
-        /*
-        this.getELBInfo().then(results => {
-            const alarms = this.getELBAlarmsForInstances(results);
-            console.log(alarms);
-        })
-        .catch(err => {
-            this.onFatalError("Could not list ELB instances. Error was:", err);
-        });
-
-        */
     }
 
-    private handleELB() : Promise<boolean> {
+    private handleELB(): Promise<boolean> {
         return new Promise<boolean>((resolve, reject) => {
-            resolve(true);
+
+            this.getELBInfo()
+                .then(results => {
+                    const alarms = this.getELBAlarmsForInstances(results);
+                    const arns = results.map(f => f.instance.LoadBalancerArn);
+
+                    this.log("Going to add the following ELB/ALB alarms and tag [" + (arns.join(", ")) + "]");
+                    this.prettyPrintAlarms(alarms);
+
+                    this.confirmActions().then((shouldApply) => {
+                        if (shouldApply) {
+                            this.applyCloudWatchAlarms(alarms).then(() => {
+                                this.elb.addTags({ResourceArns: <string[]> arns, Tags: this.getCloudWatchTag()}, (err, results) => {
+                                    if(err){
+                                        return reject(err);
+                                    }
+
+                                    resolve(true);
+                                });
+                            });
+                        } else {
+                            resolve(true);
+                        }
+                    });
+                })
+                .catch(err => {
+                    reject(err);
+                });
+
         });
     }
 
@@ -593,6 +611,8 @@ class Main {
 
     private getELBInfo() : Promise<LoadBalancerWithStatistics[]> {
 
+        this.log("Describing ELB/ALB instances...");
+
         return new Promise<LoadBalancerWithStatistics[]>((resolve, reject) => {
             this.elb.describeLoadBalancers((err, data) => {
 
@@ -614,6 +634,8 @@ class Main {
 
                             return _.find(lbTags.Tags, fx => fx.Key == "SetfiveCloudAutoWatch" && fx.Value);
                         });
+
+                        this.log("Found " + targetInstances.length + " without SetfiveCloudAutoWatch tag.");
 
                         this.getELBStatisticsForLoadbalancers(targetInstances)
                             .then(instanceWithStats => {
