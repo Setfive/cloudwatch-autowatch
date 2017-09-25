@@ -81,16 +81,36 @@ class Main {
     }
 
     private handleEc2(): Promise<boolean> {
+
         return new Promise<boolean>((resolve, reject) => {
             this.getEc2Info()
                 .then(results => {
                     const ec2Alarms = this.getEc2AlarmsForInstances(results);
-                    this.applyCloudWatchAlarms(ec2Alarms);
+                    const instanceIds = results.map(f => <string> f.InstanceId);
+                    const tagParams = {Resources: instanceIds, Tags: [{Key: "SetfiveCloudAutoWatch", Value: moment().toISOString()}]};
+
+                    /*
+                    this.applyCloudWatchAlarms(ec2Alarms)
+                        .then(() => {
+                        this.ec2.createTags(tagParams, (err, result) => {
+                            if(err){
+                                return reject(err);
+                            }
+
+                            resolve(true);
+                        });
+                    })
+                    .catch(err => {
+                        reject(err);
+                    });
+                    */
+                    
                 })
                 .catch(err => {
                     reject(err);
                 });
         });
+
     }
 
     private applyCloudWatchAlarms(alarms : PutMetricAlarmInput[]) : Promise<boolean> {
