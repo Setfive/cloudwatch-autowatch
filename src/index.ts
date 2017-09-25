@@ -9,7 +9,7 @@ import * as moment from "moment";
 import {Config} from "./config";
 import {Instance} from "aws-sdk/clients/ec2";
 import {PutMetricAlarmInput} from "aws-sdk/clients/cloudwatch";
-import {ELBStatistics} from "./types";
+import {LoadBalancerWithStatistics} from "./types";
 
 class Main {
 
@@ -31,14 +31,31 @@ class Main {
             this.onFatalError("You must specify a notificationArn option for where to receive alerts.", "");
         }
 
+        Bluebird.each(["EC2", "RDS", "ELB"], f => {
+           switch(f){
+               case "EC2":
+                   return this.handleEc2();
+               case "RDS":
+                   return this.handleRds();
+               case "ELB":
+                   return this.handleELB();
+               default: throw "Unimplemented service: " + f;
+           }
+        })
+        .catch(err => {
+            this.onFatalError("Error processing alarms.", err);
+        })
+
+        /*
         this.getELBInfo().then(results => {
-            console.log(JSON.stringify(results));
+            const alarms = this.getELBAlarmsForInstances(results);
+            console.log(alarms);
         })
         .catch(err => {
             this.onFatalError("Could not list ELB instances. Error was:", err);
         });
 
-        /*
+
         this.getRdsInfo()
             .then(results => {
                 const alarms = this.getRdsAlarmsForInstances(results);
@@ -48,15 +65,49 @@ class Main {
                 this.onFatalError("Could not list RDS instances. Error was:", err);
             });
 
-        this.getEc2Info()
-            .then(results => {
-                const ec2Alarms = this.getEc2AlarmsForInstances(results);
-                console.log(ec2Alarms);
-            })
-            .catch(err => {
-                this.onFatalError("Could not list EC2 instances. Error was:", err);
-            });
         */
+    }
+
+    private handleELB() : Promise<boolean> {
+        return new Promise<boolean>((resolve, reject) => {
+            resolve(true);
+        });
+    }
+
+    private handleRds() : Promise<boolean> {
+        return new Promise<boolean>((resolve, reject) => {
+            resolve(true);
+        });
+    }
+
+    private handleEc2(): Promise<boolean> {
+        return new Promise<boolean>((resolve, reject) => {
+            this.getEc2Info()
+                .then(results => {
+                    const ec2Alarms = this.getEc2AlarmsForInstances(results);
+                    this.applyCloudWatchAlarms(ec2Alarms);
+                })
+                .catch(err => {
+                    reject(err);
+                });
+        });
+    }
+
+    private applyCloudWatchAlarms(alarms : PutMetricAlarmInput[]) : Promise<boolean> {
+        return new Promise<boolean>((resolve, reject) => {
+            Bluebird.each(alarms, alarm => {
+                return new Promise<boolean>((resolveAlarm, rejectAlarm) => {
+                    this.cloudwatch.putMetricAlarm(alarm, (err, result) => {
+                        if(err){
+                            return rejectAlarm(err);
+                        }
+                        resolveAlarm(true);
+                    });
+                });
+            })
+            .then(results => resolve(true))
+            .catch(err => reject(err));
+        });
     }
 
     private getEc2AlarmsForInstances(instances : Instance[]) : PutMetricAlarmInput[] {
@@ -286,23 +337,85 @@ class Main {
 
     }
 
-    private getElbAlarmsForInstances(instances : AWS.ELB.LoadBalancerDescription[]) : PutMetricAlarmInput[] {
+    private getELBAlarmsForInstances(instances : LoadBalancerWithStatistics[]) : PutMetricAlarmInput[] {
         /**
          * HTTPCode_Target_5XX_Count > 0 for 5 minutes
          * TargetResponseTime > [max last 24 hrs] for 5 minutes
          * RequestCount > [max last 24 hrs]
          */
 
+        const result = instances.map(f => {
+            if(!f.instance.LoadBalancerArn){
+                throw "Missing ARN on loadbalancer?";
+            }
 
-        return [];
+            const arn = f.instance.LoadBalancerArn.split(":").pop();
+            if(!arn){
+                throw "Missing name from ARN?";
+            }
+
+            const cloudwatchDimension = arn.replace("loadbalancer/", "");
+
+            const alarms = [
+                {ActionsEnabled: true,
+                 AlarmName: "SetfiveCloudAutoWatch: 500s over 0 for 5 minutes",
+                 ComparisonOperator: "GreaterThanThreshold",
+                 MetricName: "HTTPCode_Target_5XX_Count",
+                 Namespace: "AWS/ApplicationELB",
+                 Period: 60,
+                 EvaluationPeriods: 5,
+                 Threshold: 0,
+                 Statistic: "Average",
+                 Dimensions: [{Name: "LoadBalancer", Value: cloudwatchDimension}],
+                 AlarmActions: [this.config.notificationArn]
+            },];
+
+            const maxResponse = _.max(f.TargetResponseTimes);
+            if(maxResponse) {
+                alarms.push({
+                        ActionsEnabled: true,
+                        AlarmName: "SetfiveCloudAutoWatch: Response time over 200% of 24hr max for 5 minutes",
+                        ComparisonOperator: "GreaterThanThreshold",
+                        MetricName: "TargetResponseTime",
+                        Namespace: "AWS/ApplicationELB",
+                        Period: 60,
+                        EvaluationPeriods: 5,
+                        Threshold: maxResponse * 2,
+                        Statistic: "Average",
+                        Dimensions: [{Name: "LoadBalancer", Value: cloudwatchDimension}],
+                        AlarmActions: [this.config.notificationArn]
+                });
+            }
+
+            const maxRequest = _.max(f.RequestCountCounts);
+            if(maxRequest) {
+                alarms.push({
+                        ActionsEnabled: true,
+                        AlarmName: "SetfiveCloudAutoWatch: Requests over 200% of 24hr max for 5 minutes",
+                        ComparisonOperator: "GreaterThanThreshold",
+                        MetricName: "TargetResponseTime",
+                        Namespace: "AWS/ApplicationELB",
+                        Period: 60,
+                        EvaluationPeriods: 5,
+                        Threshold: maxRequest * 2,
+                        Statistic: "Sum",
+                        Dimensions: [{Name: "LoadBalancer", Value: cloudwatchDimension}],
+                        AlarmActions: [this.config.notificationArn]
+                });
+            }
+
+            return alarms;
+        });
+
+        return _.flatten(result);
     }
 
-    private getELBStatisticsForLoadbalancers(instances : AWS.ELBv2.LoadBalancer[]) : Promise<ELBStatistics[]> {
+    private getELBStatisticsForLoadbalancers(instances : AWS.ELBv2.LoadBalancer[]) : Promise<LoadBalancerWithStatistics[]> {
 
         const startTime = moment().subtract("24", "hours").toDate();
         const endTime = moment().toDate();
 
-        return new Promise<ELBStatistics[]>((resolve, reject) => {
+        return new Promise<LoadBalancerWithStatistics[]>((resolve, reject) => {
 
             Bluebird.map(instances, (instance) => {
 
@@ -323,7 +436,7 @@ class Main {
                                     "StartTime": startTime,
                                     "EndTime": endTime,
                                     "Period": 60,
-                                    "Statistics": ["Average"],
+                                    "Statistics": ["Maximum"],
                                     "Dimensions": [{"Name": "LoadBalancer", "Value": cloudwatchDimension}]
                     };
 
@@ -343,7 +456,7 @@ class Main {
                         "StartTime": startTime,
                         "EndTime": endTime,
                         "Period": 60,
-                        "Statistics": ["Average"],
+                        "Statistics": ["Sum"],
                         "Dimensions": [{"Name": "LoadBalancer", "Value": cloudwatchDimension}]
                     };
 
@@ -358,14 +471,14 @@ class Main {
 
                 return Bluebird.all([targetTime, responseCount])
                                .then(results => {
-                                   return {LoadBalancerArn: instance.LoadBalancerArn,
-                                          TargetResponseTimes: results[0],
-                                          RequestCountCounts: results[1]};
+                                   return {instance: instance,
+                                           TargetResponseTimes: results[0].map(f => f.Maximum),
+                                           RequestCountCounts: results[1].map(f => f.Sum)};
                                });
 
             }, {concurrency: 2})
             .then(results => {
-                resolve(<ELBStatistics[]> results);
+                resolve(<LoadBalancerWithStatistics[]> results);
             })
             .catch((err) => {
                 reject(err);
@@ -374,9 +487,9 @@ class Main {
         });
     }
 
-    private getELBInfo() : Promise<AWS.ELBv2.LoadBalancer[]> {
+    private getELBInfo() : Promise<LoadBalancerWithStatistics[]> {
 
-        return new Promise<AWS.ELBv2.LoadBalancer[]>((resolve, reject) => {
+        return new Promise<LoadBalancerWithStatistics[]>((resolve, reject) => {
             this.elb.describeLoadBalancers((err, data) => {
 
                 if(err){
@@ -399,8 +512,8 @@ class Main {
                         });
 
                         this.getELBStatisticsForLoadbalancers(targetInstances)
-                            .then(instanceStats => {
-                                resolve(targetInstances);
+                            .then(instanceWithStats => {
+                                resolve(instanceWithStats);
                             })
                             .catch((err) => reject(err));
 
