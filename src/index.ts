@@ -71,55 +71,67 @@ class Main {
         });
     }
 
-    private processSavedAlarms(savedAlarms : CloudWatchAlarmSet) : void {
+    private processSavedAlarms(savedAlarms: CloudWatchAlarmSet): void {
 
         Bluebird.each(SavedAlarm.getAvailableServices(), f => {
             return new Promise<boolean>((resolve, reject) => {
                 const taggableIdOrArns = savedAlarms[f].map(e => e.taggableIdOrArn);
-                const alarms = _.flatten(savedAlarms.EC2.map(e => e.alarms));
+                const alarms = _.flatten(savedAlarms[f].map(e => e.alarms));
 
-                if(taggableIdOrArns.length == 0 || alarms.length == 0){
+                if (taggableIdOrArns.length == 0 || alarms.length == 0) {
                     this.log("No " + f + " alarms found. Skipping");
                     return resolve(true);
                 }
 
                 this.log("Applying " + f + " alarms and tags on: " + taggableIdOrArns.join(", "));
 
-                switch (f) {
-                    case "EC2":
-                        const tagParams = {Resources: taggableIdOrArns, Tags: this.getCloudWatchTag()};
-                        this.applyCloudWatchAlarms(alarms)
-                            .then(() => {
-                                this.ec2.createTags(tagParams, (err, result) => {
-                                    if (err) {
-                                        return reject(err);
-                                    }
-                                    resolve(true);
-                                });
-                            })
-                            .catch(err => {
-                                reject(err);
+                if(f == "EC2"){
+                    const tagParams = {Resources: taggableIdOrArns, Tags: this.getCloudWatchTag()};
+                    this.applyCloudWatchAlarms(alarms)
+                        .then(() => {
+                            this.ec2.createTags(tagParams, (err, result) => {
+                                if (err) {
+                                    return reject(err);
+                                }
+                                resolve(true);
                             });
-                    case "RDS":
-                        this.applyCloudWatchAlarms(alarms)
-                            .then(() => {
-                                Bluebird.each(taggableIdOrArns, arn => this.tagRds(<string> arn))
-                                        .then(() => resolve(true))
-                                        .catch(err => reject(err));
+                        })
+                        .catch(err => {
+                            reject(err);
+                        });
+                }else if(f == "RDS"){
+                    this.applyCloudWatchAlarms(alarms)
+                        .then(() => {
+                            Bluebird.each(taggableIdOrArns, arn => this.tagRds(<string> arn))
+                                .then(() => resolve(true))
+                                .catch(err => reject(err));
 
-                            })
-                            .catch(err => {
-                                reject(err);
-                            });
-                    case "ELB":
-                        return this.getELBAlarms();
-                    default:
-                        throw "Unimplemented service: " + f;
+                        })
+                        .catch(err => {
+                            reject(err);
+                        });
+                }else if(f == "ELB"){
+                    this.applyCloudWatchAlarms(alarms).then(() => {
+                        const tagParams = {
+                            ResourceArns: <string[]> taggableIdOrArns,
+                            Tags: this.getCloudWatchTag()
+                        };
+                        this.elb.addTags(tagParams, (err, results) => {
+                            if (err) {
+                                return reject(err);
+                            }
+
+                            resolve(true);
+                        });
+                    });
+                }else{
+                    throw "Unimplemented service: " + f;
                 }
             });
         })
         .then(() => {
-            this.log("Applied alarms and tags successfully.")
+            this.log("Applied alarms and tags successfully.");
+            process.exit(0);
         })
         .catch(err => {
             this.onFatalError("Error processing alarms.", err);
@@ -140,29 +152,6 @@ class Main {
                        return new SavedAlarm(f.instance.LoadBalancerArn, this.getELBAlarmsForInstance(f));
                     });
                     resolve(alarms);
-                    /*
-                    const alarms = this.getELBAlarmsForInstances(results);
-                    const arns = results.map(f => f.instance.LoadBalancerArn);
-
-                    this.log("Going to add the following ELB/ALB alarms and tag [" + (arns.join(", ")) + "]");
-                    this.prettyPrintAlarms(alarms);
-
-                    this.confirmActions().then((shouldApply) => {
-                        if (shouldApply) {
-                            this.applyCloudWatchAlarms(alarms).then(() => {
-                                this.elb.addTags({ResourceArns: <string[]> arns, Tags: this.getCloudWatchTag()}, (err, results) => {
-                                    if(err){
-                                        return reject(err);
-                                    }
-
-                                    resolve(true);
-                                });
-                            });
-                        } else {
-                            resolve(true);
-                        }
-                    });
-                    */
                 })
                 .catch(err => {
                     reject(err);
@@ -276,7 +265,7 @@ class Main {
         return [
             {
                 ActionsEnabled: true,
-                AlarmName: "SetfiveCloudAutoWatch: Status check failed",
+                AlarmName: "SetfiveCloudAutoWatch: Status check failed (" + f.InstanceId + ")",
                 ComparisonOperator: "GreaterThanThreshold",
                 MetricName: "StatusCheckFailed",
                 Namespace: "AWS/EC2",
@@ -289,7 +278,7 @@ class Main {
             },
             {
                 ActionsEnabled: true,
-                AlarmName: "SetfiveCloudAutoWatch: CPU utilization over 95%",
+                AlarmName: "SetfiveCloudAutoWatch: CPU utilization over 95% (" + f.InstanceId + ")",
                 ComparisonOperator: "GreaterThanThreshold",
                 MetricName: "CPUUtilization",
                 Namespace: "AWS/EC2",
@@ -302,7 +291,7 @@ class Main {
             },
             {
                 ActionsEnabled: true,
-                AlarmName: "SetfiveCloudAutoWatch: Network I/O low",
+                AlarmName: "SetfiveCloudAutoWatch: Network I/O low (" + f.InstanceId + ")",
                 ComparisonOperator: "LessThanThreshold",
                 MetricName: "NetworkPacketsOut",
                 Namespace: "AWS/EC2",
@@ -367,7 +356,7 @@ class Main {
         return [
             {
                 ActionsEnabled: true,
-                AlarmName: "SetfiveCloudAutoWatch: CPU utilization over 95%",
+                AlarmName: "SetfiveCloudAutoWatch: CPU utilization over 95% (" + f.DBInstanceIdentifier + ")",
                 ComparisonOperator: "GreaterThanThreshold",
                 MetricName: "CPUUtilization",
                 Namespace: "AWS/RDS",
@@ -380,7 +369,7 @@ class Main {
             },
             {
                 ActionsEnabled: true,
-                AlarmName: "SetfiveCloudAutoWatch: Storage space less than 1GB",
+                AlarmName: "SetfiveCloudAutoWatch: Storage space less than 1GB (" + f.DBInstanceIdentifier + ")",
                 ComparisonOperator: "LessThanThreshold",
                 MetricName: "FreeStorageSpace",
                 Namespace: "AWS/RDS",
@@ -393,7 +382,7 @@ class Main {
             },
             {
                 ActionsEnabled: true,
-                AlarmName: "SetfiveCloudAutoWatch: Query depth over 100",
+                AlarmName: "SetfiveCloudAutoWatch: Query depth over 100 (" + f.DBInstanceIdentifier + ")",
                 ComparisonOperator: "GreaterThanThreshold",
                 MetricName: "DiskQueueDepth",
                 Namespace: "AWS/RDS",
@@ -524,7 +513,7 @@ class Main {
 
         const alarms = [
             {ActionsEnabled: true,
-                AlarmName: "SetfiveCloudAutoWatch: 500s over 0 for 5 minutes",
+                AlarmName: "SetfiveCloudAutoWatch: 500s over 0 for 5 minutes (" + cloudwatchDimension + ")",
                 ComparisonOperator: "GreaterThanThreshold",
                 MetricName: "HTTPCode_Target_5XX_Count",
                 Namespace: "AWS/ApplicationELB",
@@ -540,7 +529,7 @@ class Main {
         if(maxResponse) {
             alarms.push({
                 ActionsEnabled: true,
-                AlarmName: "SetfiveCloudAutoWatch: Response time over 200% of 24hr max for 5 minutes",
+                AlarmName: "SetfiveCloudAutoWatch: Response time over 200% of 24hr max for 5 minutes (" + cloudwatchDimension + ")",
                 ComparisonOperator: "GreaterThanThreshold",
                 MetricName: "TargetResponseTime",
                 Namespace: "AWS/ApplicationELB",
@@ -557,7 +546,7 @@ class Main {
         if(maxRequest) {
             alarms.push({
                 ActionsEnabled: true,
-                AlarmName: "SetfiveCloudAutoWatch: Requests over 200% of 24hr max for 5 minutes",
+                AlarmName: "SetfiveCloudAutoWatch: Requests over 200% of 24hr max for 5 minutes (" + cloudwatchDimension + ")",
                 ComparisonOperator: "GreaterThanThreshold",
                 MetricName: "TargetResponseTime",
                 Namespace: "AWS/ApplicationELB",
