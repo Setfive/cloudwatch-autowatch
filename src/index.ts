@@ -6,10 +6,11 @@ import * as _ from "lodash";
 import * as colors from "colors/safe";
 import * as Bluebird from "bluebird";
 import * as moment from "moment";
+import * as fs from "fs";
 import {Config} from "./config";
 import {Instance} from "aws-sdk/clients/ec2";
 import {PutMetricAlarmInput} from "aws-sdk/clients/cloudwatch";
-import {CloudWatchTag, LoadBalancerWithStatistics} from "./types";
+import {CloudWatchTag, SavedAlarm, LoadBalancerWithStatistics, CloudWatchAlarmSet} from "./types";
 
 process.stdin.resume();
 process.stdin.setEncoding('utf8');
@@ -30,24 +31,95 @@ class Main {
         this.elb = new AWS.ELBv2({region: this.config.region});
         this.cloudwatch = new AWS.CloudWatch({region: this.config.region});
 
+        if(this.config.input){
+            const savedAlarms = <CloudWatchAlarmSet> JSON.parse(fs.readFileSync(this.config.input, "utf8"));
+            if(!savedAlarms){
+                this.onFatalError("Could not open or parse " + this.config.input, null);
+            }
+
+            return this.processSavedAlarms(savedAlarms);
+        }
+
         if(!this.config.notificationArn){
             this.onFatalError("You must specify a notificationArn option for where to receive alerts.", "");
         }
 
-        Bluebird.each(["EC2", "RDS", "ELB"], f => {
+        Bluebird.mapSeries(SavedAlarm.getAvailableServices(), f => {
            switch(f){
                case "EC2":
-                   return this.handleEc2();
+                   return this.getEc2Alarms();
                case "RDS":
-                   return this.handleRds();
+                   return this.getRdsAlarms();
                case "ELB":
-                   return this.handleELB();
+                   return this.getELBAlarms();
                default: throw "Unimplemented service: " + f;
            }
         })
-        .then(() => {
-            this.log("We're done. Exiting.");
+        .then((results) => {
+            const savedAlarms : CloudWatchAlarmSet = {
+                EC2 : results[0],
+                RDS : results[1],
+                ELB : results[2]
+            };
+
+            fs.writeFileSync("alarms.json", JSON.stringify(savedAlarms, null, 2));
+            this.log("Writing proposed alarms to alarms.json. Run with '--input=alarms.json' to add them.");
             process.exit(0);
+        })
+        .catch(err => {
+            this.onFatalError("Error processing alarms.", err);
+        });
+    }
+
+    private processSavedAlarms(savedAlarms : CloudWatchAlarmSet) : void {
+
+        Bluebird.each(SavedAlarm.getAvailableServices(), f => {
+            return new Promise<boolean>((resolve, reject) => {
+                const taggableIdOrArns = savedAlarms[f].map(e => e.taggableIdOrArn);
+                const alarms = _.flatten(savedAlarms.EC2.map(e => e.alarms));
+
+                if(taggableIdOrArns.length == 0 || alarms.length == 0){
+                    this.log("No " + f + " alarms found. Skipping");
+                    return resolve(true);
+                }
+
+                this.log("Applying " + f + " alarms and tags on: " + taggableIdOrArns.join(", "));
+
+                switch (f) {
+                    case "EC2":
+                        const tagParams = {Resources: taggableIdOrArns, Tags: this.getCloudWatchTag()};
+                        this.applyCloudWatchAlarms(alarms)
+                            .then(() => {
+                                this.ec2.createTags(tagParams, (err, result) => {
+                                    if (err) {
+                                        return reject(err);
+                                    }
+                                    resolve(true);
+                                });
+                            })
+                            .catch(err => {
+                                reject(err);
+                            });
+                    case "RDS":
+                        this.applyCloudWatchAlarms(alarms)
+                            .then(() => {
+                                Bluebird.each(taggableIdOrArns, arn => this.tagRds(<string> arn))
+                                        .then(() => resolve(true))
+                                        .catch(err => reject(err));
+
+                            })
+                            .catch(err => {
+                                reject(err);
+                            });
+                    case "ELB":
+                        return this.getELBAlarms();
+                    default:
+                        throw "Unimplemented service: " + f;
+                }
+            });
+        })
+        .then(() => {
+            this.log("Applied alarms and tags successfully.")
         })
         .catch(err => {
             this.onFatalError("Error processing alarms.", err);
@@ -55,11 +127,20 @@ class Main {
 
     }
 
-    private handleELB(): Promise<boolean> {
-        return new Promise<boolean>((resolve, reject) => {
+    private getELBAlarms(): Promise<SavedAlarm[]> {
+        return new Promise<SavedAlarm[]>((resolve, reject) => {
 
             this.getELBInfo()
                 .then(results => {
+                    const alarms = results.map(f => {
+                       if(!f.instance.LoadBalancerArn){
+                           throw "Missing load balancer ARN?";
+                       }
+
+                       return new SavedAlarm(f.instance.LoadBalancerArn, this.getELBAlarmsForInstance(f));
+                    });
+                    resolve(alarms);
+                    /*
                     const alarms = this.getELBAlarmsForInstances(results);
                     const arns = results.map(f => f.instance.LoadBalancerArn);
 
@@ -81,6 +162,7 @@ class Main {
                             resolve(true);
                         }
                     });
+                    */
                 })
                 .catch(err => {
                     reject(err);
@@ -101,34 +183,20 @@ class Main {
         });
     }
 
-    private handleRds() : Promise<boolean> {
-        return new Promise<boolean>((resolve, reject) => {
+    private getRdsAlarms() : Promise<SavedAlarm[]> {
+        return new Promise<SavedAlarm[]>((resolve, reject) => {
 
             this.getRdsInfo()
                 .then(results => {
-                    const alarms = this.getRdsAlarmsForInstances(results);
-                    const arns = results.map(f => f.DBInstanceArn);
+                    const alarms = results.map(f => {
+                       if(!f.DBInstanceArn){
+                           throw "Missing DB instance ARN?";
+                       }
 
-                    this.log("Going to add the following RDS alarms and tag [" + (arns.join(", ")) + "]");
-                    this.prettyPrintAlarms(alarms);
-
-                    this.confirmActions().then((shouldApply) => {
-                        if(shouldApply) {
-                            this.applyCloudWatchAlarms(alarms)
-                                .then(() => {
-                                    Bluebird.each(arns, arn => this.tagRds(<string> arn))
-                                            .then(() => resolve(true))
-                                            .catch(err => reject(err));
-
-                                })
-                                .catch(err => {
-                                    reject(err);
-                                });
-                        }else{
-                            resolve(true);
-                        }
+                       return new SavedAlarm(f.DBInstanceArn, this.getRdsAlarmsForInstance(f));
                     });
 
+                    resolve(alarms);
                 })
                 .catch(err => {
                     reject(err);
@@ -162,38 +230,19 @@ class Main {
 
     }
 
-    private handleEc2(): Promise<boolean> {
+    private getEc2Alarms(): Promise<SavedAlarm[]> {
 
-        return new Promise<boolean>((resolve, reject) => {
+        return new Promise<SavedAlarm[]>((resolve, reject) => {
             this.getEc2Info()
                 .then(results => {
-                    const ec2Alarms = this.getEc2AlarmsForInstances(results);
-                    const instanceIds = results.map(f => <string> f.InstanceId);
-                    const tagParams = {Resources: instanceIds, Tags: this.getCloudWatchTag()};
-
-                    this.log("Going to add the following EC2 alarms and tag [" + (instanceIds.join(", ")) + "]");
-                    this.prettyPrintAlarms(ec2Alarms);
-
-                    this.confirmActions().then((shouldApply) => {
-                        if(shouldApply) {
-                            this.applyCloudWatchAlarms(ec2Alarms)
-                                .then(() => {
-                                    this.ec2.createTags(tagParams, (err, result) => {
-                                        if (err) {
-                                            return reject(err);
-                                        }
-
-                                        resolve(true);
-                                    });
-                                })
-                                .catch(err => {
-                                    reject(err);
-                                });
-                        }else{
-                            resolve(true);
+                    const ec2Alarms = results.map(f => {
+                        if(!f.InstanceId){
+                            throw "Misisng instance id.";
                         }
+                      return new SavedAlarm(f.InstanceId, this.getEc2AlarmsForInstance(f));
                     });
 
+                    resolve(ec2Alarms);
                 })
                 .catch(err => {
                     reject(err);
@@ -219,6 +268,54 @@ class Main {
         });
     }
 
+    private getEc2AlarmsForInstance(f : Instance) : PutMetricAlarmInput[] {
+        if(!f.InstanceId){
+            throw "Null instanceId on EC2?";
+        }
+
+        return [
+            {
+                ActionsEnabled: true,
+                AlarmName: "SetfiveCloudAutoWatch: Status check failed",
+                ComparisonOperator: "GreaterThanThreshold",
+                MetricName: "StatusCheckFailed",
+                Namespace: "AWS/EC2",
+                Period: 60,
+                EvaluationPeriods: 1,
+                Threshold: 0,
+                Statistic: "Maximum",
+                Dimensions: [{Name: "InstanceId", Value: f.InstanceId}],
+                AlarmActions: [this.config.notificationArn]
+            },
+            {
+                ActionsEnabled: true,
+                AlarmName: "SetfiveCloudAutoWatch: CPU utilization over 95%",
+                ComparisonOperator: "GreaterThanThreshold",
+                MetricName: "CPUUtilization",
+                Namespace: "AWS/EC2",
+                Period: 60,
+                EvaluationPeriods: 5,
+                Threshold: 95,
+                Statistic: "Average",
+                Dimensions: [{Name: "InstanceId", Value: f.InstanceId}],
+                AlarmActions: [this.config.notificationArn]
+            },
+            {
+                ActionsEnabled: true,
+                AlarmName: "SetfiveCloudAutoWatch: Network I/O low",
+                ComparisonOperator: "LessThanThreshold",
+                MetricName: "NetworkPacketsOut",
+                Namespace: "AWS/EC2",
+                Period: 60,
+                EvaluationPeriods: 5,
+                Threshold: 100,
+                Statistic: "Average",
+                Dimensions: [{Name: "InstanceId", Value: f.InstanceId}],
+                AlarmActions: [this.config.notificationArn]
+            }
+        ];
+    }
+
     private getEc2AlarmsForInstances(instances : Instance[]) : PutMetricAlarmInput[] {
         /**
          * StatusCheckFailed > 0
@@ -228,52 +325,7 @@ class Main {
          */
 
         const result = instances.map(f => {
-
-            if(!f.InstanceId){
-                throw "Null instanceId on EC2?";
-            }
-
-            return [
-                {
-                    ActionsEnabled: true,
-                    AlarmName: "SetfiveCloudAutoWatch: Status check failed",
-                    ComparisonOperator: "GreaterThanThreshold",
-                    MetricName: "StatusCheckFailed",
-                    Namespace: "AWS/EC2",
-                    Period: 60,
-                    EvaluationPeriods: 1,
-                    Threshold: 0,
-                    Statistic: "Maximum",
-                    Dimensions: [{Name: "InstanceId", Value: f.InstanceId}],
-                    AlarmActions: [this.config.notificationArn]
-                },
-                {
-                    ActionsEnabled: true,
-                    AlarmName: "SetfiveCloudAutoWatch: CPU utilization over 95%",
-                    ComparisonOperator: "GreaterThanThreshold",
-                    MetricName: "CPUUtilization",
-                    Namespace: "AWS/EC2",
-                    Period: 60,
-                    EvaluationPeriods: 5,
-                    Threshold: 95,
-                    Statistic: "Average",
-                    Dimensions: [{Name: "InstanceId", Value: f.InstanceId}],
-                    AlarmActions: [this.config.notificationArn]
-                },
-                {
-                    ActionsEnabled: true,
-                    AlarmName: "SetfiveCloudAutoWatch: Network I/O low",
-                    ComparisonOperator: "LessThanThreshold",
-                    MetricName: "NetworkPacketsOut",
-                    Namespace: "AWS/EC2",
-                    Period: 60,
-                    EvaluationPeriods: 5,
-                    Threshold: 100,
-                    Statistic: "Average",
-                    Dimensions: [{Name: "InstanceId", Value: f.InstanceId}],
-                    AlarmActions: [this.config.notificationArn]
-                }
-            ]
+            return this.getEc2AlarmsForInstance(f);
         });
 
         return _.flatten(result);
@@ -307,62 +359,61 @@ class Main {
         });
     }
 
+    private getRdsAlarmsForInstance(f : AWS.RDS.DBInstance) : PutMetricAlarmInput[] {
+        if(!f.DBInstanceIdentifier){
+            throw "Null identifier on RDS?";
+        }
+
+        return [
+            {
+                ActionsEnabled: true,
+                AlarmName: "SetfiveCloudAutoWatch: CPU utilization over 95%",
+                ComparisonOperator: "GreaterThanThreshold",
+                MetricName: "CPUUtilization",
+                Namespace: "AWS/RDS",
+                Period: 60,
+                EvaluationPeriods: 5,
+                Threshold: 95,
+                Statistic: "Average",
+                Dimensions: [{Name: "DBInstanceIdentifier", Value: f.DBInstanceIdentifier}],
+                AlarmActions: [this.config.notificationArn]
+            },
+            {
+                ActionsEnabled: true,
+                AlarmName: "SetfiveCloudAutoWatch: Storage space less than 1GB",
+                ComparisonOperator: "LessThanThreshold",
+                MetricName: "FreeStorageSpace",
+                Namespace: "AWS/RDS",
+                Period: 60,
+                EvaluationPeriods: 5,
+                Threshold: 1073741824,
+                Statistic: "Average",
+                Dimensions: [{Name: "DBInstanceIdentifier", Value: f.DBInstanceIdentifier}],
+                AlarmActions: [this.config.notificationArn]
+            },
+            {
+                ActionsEnabled: true,
+                AlarmName: "SetfiveCloudAutoWatch: Query depth over 100",
+                ComparisonOperator: "GreaterThanThreshold",
+                MetricName: "DiskQueueDepth",
+                Namespace: "AWS/RDS",
+                Period: 60,
+                EvaluationPeriods: 5,
+                Threshold: 100,
+                Statistic: "Average",
+                Dimensions: [{Name: "DBInstanceIdentifier", Value: f.DBInstanceIdentifier}],
+                AlarmActions: [this.config.notificationArn]
+            },
+        ];
+    }
+
     private getRdsAlarmsForInstances(instances : AWS.RDS.DBInstance[]) : PutMetricAlarmInput[] {
         /*
         * CPUUtilization > 95% for 5 minute
         * FreeStorageSpace < 1gb for 5 minute
         * DiskQueueDepth > 100 for 5 minutes
         */
-
-        const result = instances.map(f => {
-
-            if(!f.DBInstanceIdentifier){
-                throw "Null identifier on RDS?";
-            }
-
-            return [
-                {
-                    ActionsEnabled: true,
-                    AlarmName: "SetfiveCloudAutoWatch: CPU utilization over 95%",
-                    ComparisonOperator: "GreaterThanThreshold",
-                    MetricName: "CPUUtilization",
-                    Namespace: "AWS/RDS",
-                    Period: 60,
-                    EvaluationPeriods: 5,
-                    Threshold: 95,
-                    Statistic: "Average",
-                    Dimensions: [{Name: "DBInstanceIdentifier", Value: f.DBInstanceIdentifier}],
-                    AlarmActions: [this.config.notificationArn]
-                },
-                {
-                    ActionsEnabled: true,
-                    AlarmName: "SetfiveCloudAutoWatch: Storage space less than 1GB",
-                    ComparisonOperator: "LessThanThreshold",
-                    MetricName: "FreeStorageSpace",
-                    Namespace: "AWS/RDS",
-                    Period: 60,
-                    EvaluationPeriods: 5,
-                    Threshold: 1073741824,
-                    Statistic: "Average",
-                    Dimensions: [{Name: "DBInstanceIdentifier", Value: f.DBInstanceIdentifier}],
-                    AlarmActions: [this.config.notificationArn]
-                },
-                {
-                    ActionsEnabled: true,
-                    AlarmName: "SetfiveCloudAutoWatch: Query depth over 100",
-                    ComparisonOperator: "GreaterThanThreshold",
-                    MetricName: "DiskQueueDepth",
-                    Namespace: "AWS/RDS",
-                    Period: 60,
-                    EvaluationPeriods: 5,
-                    Threshold: 100,
-                    Statistic: "Average",
-                    Dimensions: [{Name: "DBInstanceIdentifier", Value: f.DBInstanceIdentifier}],
-                    AlarmActions: [this.config.notificationArn]
-                },
-            ]
-        });
-
+        const result = instances.map(f => this.getRdsAlarmsForInstance(f));
         return _.flatten(result);
     }
 
@@ -459,6 +510,69 @@ class Main {
 
     }
 
+    private getELBAlarmsForInstance(f : LoadBalancerWithStatistics) : PutMetricAlarmInput[] {
+        if(!f.instance.LoadBalancerArn){
+            throw "Missing ARN on loadbalancer?";
+        }
+
+        const arn = f.instance.LoadBalancerArn.split(":").pop();
+        if(!arn){
+            throw "Missing name from ARN?";
+        }
+
+        const cloudwatchDimension = arn.replace("loadbalancer/", "");
+
+        const alarms = [
+            {ActionsEnabled: true,
+                AlarmName: "SetfiveCloudAutoWatch: 500s over 0 for 5 minutes",
+                ComparisonOperator: "GreaterThanThreshold",
+                MetricName: "HTTPCode_Target_5XX_Count",
+                Namespace: "AWS/ApplicationELB",
+                Period: 60,
+                EvaluationPeriods: 5,
+                Threshold: 0,
+                Statistic: "Average",
+                Dimensions: [{Name: "LoadBalancer", Value: cloudwatchDimension}],
+                AlarmActions: [this.config.notificationArn]
+            },];
+
+        const maxResponse = _.max(f.TargetResponseTimes);
+        if(maxResponse) {
+            alarms.push({
+                ActionsEnabled: true,
+                AlarmName: "SetfiveCloudAutoWatch: Response time over 200% of 24hr max for 5 minutes",
+                ComparisonOperator: "GreaterThanThreshold",
+                MetricName: "TargetResponseTime",
+                Namespace: "AWS/ApplicationELB",
+                Period: 60,
+                EvaluationPeriods: 5,
+                Threshold: maxResponse * 2,
+                Statistic: "Average",
+                Dimensions: [{Name: "LoadBalancer", Value: cloudwatchDimension}],
+                AlarmActions: [this.config.notificationArn]
+            });
+        }
+
+        const maxRequest = _.max(f.RequestCountCounts);
+        if(maxRequest) {
+            alarms.push({
+                ActionsEnabled: true,
+                AlarmName: "SetfiveCloudAutoWatch: Requests over 200% of 24hr max for 5 minutes",
+                ComparisonOperator: "GreaterThanThreshold",
+                MetricName: "TargetResponseTime",
+                Namespace: "AWS/ApplicationELB",
+                Period: 60,
+                EvaluationPeriods: 5,
+                Threshold: maxRequest * 2,
+                Statistic: "Sum",
+                Dimensions: [{Name: "LoadBalancer", Value: cloudwatchDimension}],
+                AlarmActions: [this.config.notificationArn]
+            });
+        }
+
+        return alarms;
+    }
+
     private getELBAlarmsForInstances(instances : LoadBalancerWithStatistics[]) : PutMetricAlarmInput[] {
         /**
          * HTTPCode_Target_5XX_Count > 0 for 5 minutes
@@ -466,69 +580,7 @@ class Main {
          * RequestCount > [max last 24 hrs]
          */
 
-        const result = instances.map(f => {
-            if(!f.instance.LoadBalancerArn){
-                throw "Missing ARN on loadbalancer?";
-            }
-
-            const arn = f.instance.LoadBalancerArn.split(":").pop();
-            if(!arn){
-                throw "Missing name from ARN?";
-            }
-
-            const cloudwatchDimension = arn.replace("loadbalancer/", "");
-
-            const alarms = [
-                {ActionsEnabled: true,
-                 AlarmName: "SetfiveCloudAutoWatch: 500s over 0 for 5 minutes",
-                 ComparisonOperator: "GreaterThanThreshold",
-                 MetricName: "HTTPCode_Target_5XX_Count",
-                 Namespace: "AWS/ApplicationELB",
-                 Period: 60,
-                 EvaluationPeriods: 5,
-                 Threshold: 0,
-                 Statistic: "Average",
-                 Dimensions: [{Name: "LoadBalancer", Value: cloudwatchDimension}],
-                 AlarmActions: [this.config.notificationArn]
-            },];
-
-            const maxResponse = _.max(f.TargetResponseTimes);
-            if(maxResponse) {
-                alarms.push({
-                        ActionsEnabled: true,
-                        AlarmName: "SetfiveCloudAutoWatch: Response time over 200% of 24hr max for 5 minutes",
-                        ComparisonOperator: "GreaterThanThreshold",
-                        MetricName: "TargetResponseTime",
-                        Namespace: "AWS/ApplicationELB",
-                        Period: 60,
-                        EvaluationPeriods: 5,
-                        Threshold: maxResponse * 2,
-                        Statistic: "Average",
-                        Dimensions: [{Name: "LoadBalancer", Value: cloudwatchDimension}],
-                        AlarmActions: [this.config.notificationArn]
-                });
-            }
-
-            const maxRequest = _.max(f.RequestCountCounts);
-            if(maxRequest) {
-                alarms.push({
-                        ActionsEnabled: true,
-                        AlarmName: "SetfiveCloudAutoWatch: Requests over 200% of 24hr max for 5 minutes",
-                        ComparisonOperator: "GreaterThanThreshold",
-                        MetricName: "TargetResponseTime",
-                        Namespace: "AWS/ApplicationELB",
-                        Period: 60,
-                        EvaluationPeriods: 5,
-                        Threshold: maxRequest * 2,
-                        Statistic: "Sum",
-                        Dimensions: [{Name: "LoadBalancer", Value: cloudwatchDimension}],
-                        AlarmActions: [this.config.notificationArn]
-                });
-            }
-
-            return alarms;
-        });
-
+        const result = instances.map(f => this.getELBAlarmsForInstance(f));
         return _.flatten(result);
     }
 
