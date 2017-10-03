@@ -21,6 +21,7 @@ class Main {
     private ec2 : AWS.EC2;
     private rds : AWS.RDS;
     private elb : AWS.ELBv2;
+    private sns : AWS.SNS;
     private cloudwatch : AWS.CloudWatch;
 
     public main() : void {
@@ -29,18 +30,27 @@ class Main {
         this.ec2 = new AWS.EC2({region: this.config.region});
         this.rds = new AWS.RDS({region: this.config.region});
         this.elb = new AWS.ELBv2({region: this.config.region});
+        this.sns = new AWS.SNS({region: this.config.region});
         this.cloudwatch = new AWS.CloudWatch({region: this.config.region});
 
-        if(this.config.input){
-            const savedAlarms = <CloudWatchAlarmSet> JSON.parse(fs.readFileSync(this.config.input, "utf8"));
-            if(!savedAlarms){
-                this.onFatalError("Could not open or parse " + this.config.input, null);
-            }
-
-            return this.processSavedAlarms(savedAlarms);
+        if(this.config.help){
+            return Config.outputHelp();
         }
 
-        if(!this.config.notificationArn){
+        if(this.config.input){
+            try {
+                const savedAlarms = <CloudWatchAlarmSet> JSON.parse(fs.readFileSync(this.config.input, "utf8"));
+                if (!savedAlarms) {
+                    this.onFatalError("Could not parse " + this.config.input, null);
+                }
+
+                return this.processSavedAlarms(savedAlarms);
+            }catch (e){
+                this.onFatalError(e, null);
+            }
+        }
+
+        if(this.config.generateAlarms && !this.config.notificationArn){
             this.onFatalError("You must specify a notificationArn option for where to receive alerts.", "");
         }
 
@@ -707,7 +717,9 @@ class Main {
 
     private onFatalError(msg : string, error : any) : void {
         console.log(colors.red(msg));
-        console.log(error);
+        if(error) {
+            console.log(error);
+        }
         process.exit(-1);
     }
 }
