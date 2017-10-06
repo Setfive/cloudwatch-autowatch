@@ -19,6 +19,7 @@ export class CloudWatchAlarmSet {
     EC2 : SavedAlarm[];
     RDS : SavedAlarm[];
     ELB : SavedAlarm[];
+    Redshift: SavedAlarm[];
 }
 
 export class SavedAlarm {
@@ -31,6 +32,6 @@ export class SavedAlarm {
     }
 
     public static getAvailableServices() : CloudWatchAlarmSetServices[] {
-        return ["EC2", "RDS", "ELB"];
+        return ["EC2", "RDS", "ELB", "Redshift"];
     }
 }

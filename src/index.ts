@@ -22,6 +22,7 @@ class Main {
     private rds : AWS.RDS;
     private elb : AWS.ELBv2;
     private sns : AWS.SNS;
+    private redshift : AWS.Redshift;
     private cloudwatch : AWS.CloudWatch;
 
     public main() : void {
@@ -31,13 +32,51 @@ class Main {
         this.rds = new AWS.RDS({region: this.config.region});
         this.elb = new AWS.ELBv2({region: this.config.region});
         this.sns = new AWS.SNS({region: this.config.region});
+        this.redshift = new AWS.Redshift({region: this.config.region});
         this.cloudwatch = new AWS.CloudWatch({region: this.config.region});
 
-        if(this.config.help){
+        if (this.config.action == "help" || this.config.action == "") {
             return Config.outputHelp();
-        }
+        } else if (this.config.action == "generateAlarms") {
+            if (!this.config.notificationArn || this.config.notificationArn.length == 0) {
+                this.onFatalError("You must specify a notificationArn option for where to receive alerts.", "");
+            }
 
-        if(this.config.input){
+            Bluebird.mapSeries(SavedAlarm.getAvailableServices(), f => {
+                    switch (f) {
+                        case "EC2":
+                            return this.getEc2Alarms();
+                        case "RDS":
+                            return this.getRdsAlarms();
+                        case "ELB":
+                            return this.getELBAlarms();
+                        case "Redshift":
+                            return this.getRedshiftAlarms();
+                        default:
+                            throw "Unimplemented service: " + f;
+                    }
+                })
+                .then((results) => {
+                    const savedAlarms: CloudWatchAlarmSet = {
+                        EC2: results[0],
+                        RDS: results[1],
+                        ELB: results[2],
+                        Redshift: results[3]
+                    };
+
+                    fs.writeFileSync(this.config.output, JSON.stringify(savedAlarms, null, 2));
+                    this.log("Writing proposed alarms to alarms.json. Run with '--input=alarms.json' to add them.");
+                    process.exit(0);
+                })
+                .catch(err => {
+                    this.onFatalError("Error generating alarms.", err);
+                });
+
+        } else if (this.config.action == "addAlarmsFromFile") {
+            if (!this.config.input || this.config.input.length == 0) {
+                this.onFatalError("You must specify an input JSON file to add alerts.", "");
+            }
+
             try {
                 const savedAlarms = <CloudWatchAlarmSet> JSON.parse(fs.readFileSync(this.config.input, "utf8"));
                 if (!savedAlarms) {
@@ -45,40 +84,35 @@ class Main {
                 }
 
                 return this.processSavedAlarms(savedAlarms);
-            }catch (e){
+            } catch (e) {
                 this.onFatalError(e, null);
             }
+        } else if (this.config.action == "listSnsTopics") {
+
+            this.sns.listTopics((err, results) => {
+                if(err){
+                    return this.onFatalError("Could not list SNS topics", err);
+                }
+
+                this.log("Available SNS Topics:");
+                if(results.Topics) {
+                    results.Topics.forEach(f => {
+                        const arn = f.TopicArn ? f.TopicArn : "No ARN";
+                        this.log(arn);
+                    });
+                }
+
+                process.exit(0);
+            });
+
+        } else {
+            this.onFatalError("Unrecognized action: " + this.config.action, "");
         }
 
-        if(this.config.generateAlarms && !this.config.notificationArn){
-            this.onFatalError("You must specify a notificationArn option for where to receive alerts.", "");
-        }
+    }
 
-        Bluebird.mapSeries(SavedAlarm.getAvailableServices(), f => {
-           switch(f){
-               case "EC2":
-                   return this.getEc2Alarms();
-               case "RDS":
-                   return this.getRdsAlarms();
-               case "ELB":
-                   return this.getELBAlarms();
-               default: throw "Unimplemented service: " + f;
-           }
-        })
-        .then((results) => {
-            const savedAlarms : CloudWatchAlarmSet = {
-                EC2 : results[0],
-                RDS : results[1],
-                ELB : results[2]
-            };
-
-            fs.writeFileSync("alarms.json", JSON.stringify(savedAlarms, null, 2));
-            this.log("Writing proposed alarms to alarms.json. Run with '--input=alarms.json' to add them.");
-            process.exit(0);
-        })
-        .catch(err => {
-            this.onFatalError("Error processing alarms.", err);
-        });
+    private onNever(o : never) : void {
+        this.onFatalError("Unrecognized: " + o, "");
     }
 
     private processSavedAlarms(savedAlarms: CloudWatchAlarmSet): void {
@@ -134,8 +168,18 @@ class Main {
                             resolve(true);
                         });
                     });
+                }else if(f == "Redshift"){
+                    this.applyCloudWatchAlarms(alarms).then(() => {
+                        const tagParams = {
+                            ResourceName: <string[]> taggableIdOrArns,
+                            Tags: this.getCloudWatchTag()
+                        };
+
+                        // TODO: Need to tag the Redshift cluster here
+                        
+                    });
                 }else{
-                    throw "Unimplemented service: " + f;
+                    this.onNever(f);
                 }
             });
         })
@@ -144,7 +188,108 @@ class Main {
             process.exit(0);
         })
         .catch(err => {
-            this.onFatalError("Error processing alarms.", err);
+            this.onFatalError("Error adding alarms.", err);
+        });
+
+    }
+
+    private getRedshiftAlarms() : Promise<SavedAlarm[]> {
+
+        return new Promise<SavedAlarm[]>((resolve, reject) => {
+            this.getRedshiftInfo().then((targetClusters) => {
+                const alarms = targetClusters.map(f => {
+                    if(!f.ClusterIdentifier){
+                        throw "Missing cluster identifier.";
+                    }
+
+                    return new SavedAlarm(f.ClusterIdentifier, this.getRedshiftAlarmsForCluster(f));
+                });
+                resolve([]);
+            })
+            .catch(err => {
+               reject(err);
+            });
+        });
+
+    }
+
+    private getRedshiftAlarmsForCluster(cluster : AWS.Redshift.Cluster) : PutMetricAlarmInput[] {
+        if(!cluster.ClusterIdentifier){
+            throw "Null identifier on Redshift?";
+        }
+
+        /**
+         * CPUUtilization > 95% for 5 minutes
+         * HealthStatus = 0 for 5 minutes
+         * PercentageDiskSpaceUsed > 95% for 5 minutes
+         */
+
+        return [
+            {
+                ActionsEnabled: true,
+                AlarmName: "SetfiveCloudAutoWatch: CPU utilization over 95% (" + cluster.ClusterIdentifier + ")",
+                ComparisonOperator: "GreaterThanThreshold",
+                MetricName: "CPUUtilization",
+                Namespace: "AWS/Redshift",
+                Period: 60,
+                EvaluationPeriods: 5,
+                Threshold: 95,
+                Statistic: "Average",
+                Dimensions: [{Name: "ClusterIdentifier", Value: cluster.ClusterIdentifier}],
+                AlarmActions: [this.config.notificationArn]
+            },
+            {
+                ActionsEnabled: true,
+                AlarmName: "SetfiveCloudAutoWatch: Health status is 0 (" + cluster.ClusterIdentifier + ")",
+                ComparisonOperator: "LessThanOrEqualToThreshold",
+                MetricName: "HealthStatus",
+                Namespace: "AWS/Redshift",
+                Period: 60,
+                EvaluationPeriods: 5,
+                Threshold: 0,
+                Statistic: "Average",
+                Dimensions: [{Name: "ClusterIdentifier", Value: cluster.ClusterIdentifier}],
+                AlarmActions: [this.config.notificationArn]
+            },
+            {
+                ActionsEnabled: true,
+                AlarmName: "SetfiveCloudAutoWatch: Disk space over 95% (" + cluster.ClusterIdentifier + ")",
+                ComparisonOperator: "GreaterThanThreshold",
+                MetricName: "PercentageDiskSpaceUsed",
+                Namespace: "AWS/Redshift",
+                Period: 60,
+                EvaluationPeriods: 5,
+                Threshold: 95,
+                Statistic: "Average",
+                Dimensions: [{Name: "ClusterIdentifier", Value: cluster.ClusterIdentifier}],
+                AlarmActions: [this.config.notificationArn]
+            },
+        ];
+    }
+
+    private getRedshiftInfo() : Promise<AWS.Redshift.Cluster[]> {
+
+        return new Promise<AWS.Redshift.Cluster[]>((resolve, reject) => {
+            this.redshift.describeClusters((err, results) => {
+                if(err){
+                    return reject(err);
+                }
+
+                if(!results.Clusters){
+                    return resolve([]);
+                }
+
+                const targetClusters = _.reject(results.Clusters, f => {
+                    return _.find(f.Tags, f => f.Key == "SetfiveCloudAutoWatch" && f.Value);
+                });
+
+                this.log("Found " + targetClusters.length + " Redshift clusters without SetfiveCloudAutoWatch tag.");
+                targetClusters.forEach(cluster => {
+                    this.log("Identifier: " + cluster.ClusterIdentifier);
+                });
+
+                resolve(targetClusters);
+            });
         });
 
     }
@@ -348,10 +493,10 @@ class Main {
                    return _.find(f.Tags, f => f.Key == "SetfiveCloudAutoWatch" && f.Value);
                 });
 
-                this.log("Found " + result.length + " instances without SetfiveCloudAutoWatch tag.");
+                this.log("Found " + result.length + " EC instances without SetfiveCloudAutoWatch tag.");
                 result.forEach(instance => {
                     this.log("ID: " + instance.InstanceId);
-                })
+                });
 
                 resolve(result);
             });

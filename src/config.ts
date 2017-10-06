@@ -1,19 +1,23 @@
+export type AutowatchAction = "generateAlarms" | "addAlarmsFromFile" | "listSnsTopics" | "help" | "";
+
 export class Config {
 
     public readonly region : string;
     public readonly notificationArn : string;
     public readonly generateAlarms : boolean;
     public readonly input : string;
+    public readonly output : string;
+    public readonly action : AutowatchAction;
     public readonly help : boolean;
 
     public static getConfig() : Config {
         const argvs = process.argv.slice(2);
         if(argvs.length == 0){
-            return {help: true, generateAlarms : false,
-                    region: "", notificationArn: "", input: ""};
+            return {help: true, generateAlarms : false, action: "",
+                    region: "", notificationArn: "", input: "", output: ""};
         }
 
-        const argv = require("minimist")(argvs, {"boolean": ["help", "generateAlarms"], "default": {"region": "us-east-1"}});
+        const argv = require("minimist")(argvs, {"boolean": ["help", "generateAlarms"], "default": {"region": "us-east-1", "output": "alarms.json"}});
 
         return <Config> argv;
     }
@@ -28,21 +32,26 @@ These alarms are intended to serve only as a starting point, mostly useful when 
 Note: The AWS client authenticates automatically using IAM roles, environment variables, or a JSON credential file.
       One of these must be available in order for cloudwatch-auto to work.  
 
-Action Flags:        
-    --generateAlarms        Generates alarms.json based on AWS resources   
-    --input                 A JSON file with alarms to add
+Action Flags:
+Pass any one of these as an argument to --action. Ex. --action=generateAlarms
 
+    generateAlarms:             Generates a file based on AWS resources. The file is alarms.json by default.   
+    addAlarmsFromFile:          Add alarms from a JSON file specified by --input (see below)
+    listSnsTopics:              Lists the available SNS topics
+    help:                       Prints this message
+    
 Options:
-    --notificationArn       The SNS topic ARN to use for notifications
-    --region                The AWS region to access. Defaults to us-east-1
-    --help                  Prints this message
+    --notificationArn       The SNS topic ARN to use for notifications. Use with 'generateAlarms'
+    --output                The JSON file to output alarms to. Use with 'generateAlarms'
+    --input                 The JSON file to add alarms from. Use with 'addAlarmsFromFile'    
+    --region                The AWS region to access. Defaults to us-east-1                      
         
 Examples:
     # This will create a file named alarms.json
-    cloudwatch-auto --generateAlarms --notificationArn=arn:aws:sns:us-east-1:123:ContactAndCloudWatch
+    cloudwatch-auto --action=generateAlarms --notificationArn=arn:aws:sns:us-east-1:123:ContactAndCloudWatch
     
     # Now, create the alarms contained inside alarms.json. You can edit the alarms before adding them.
-    cloudwatch-auto --input=alarms.json               
+    cloudwatch-auto --action=addAlarmsFromFile --input=alarms.json               
 `;
         console.log(help);
         process.exit(0);
