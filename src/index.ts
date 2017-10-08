@@ -18,6 +18,8 @@ process.stdin.setEncoding('utf8');
 class Main {
 
     private config : Config;
+    private accountId : string;
+
     private ec2 : AWS.EC2;
     private rds : AWS.RDS;
     private elb : AWS.ELBv2;
@@ -42,35 +44,30 @@ class Main {
                 this.onFatalError("You must specify a notificationArn option for where to receive alerts.", "");
             }
 
-            Bluebird.mapSeries(SavedAlarm.getAvailableServices(), f => {
-                    switch (f) {
-                        case "EC2":
-                            return this.getEc2Alarms();
-                        case "RDS":
-                            return this.getRdsAlarms();
-                        case "ELB":
-                            return this.getELBAlarms();
-                        case "Redshift":
-                            return this.getRedshiftAlarms();
-                        default:
-                            throw "Unimplemented service: " + f;
-                    }
-                })
-                .then((results) => {
-                    const savedAlarms: CloudWatchAlarmSet = {
-                        EC2: results[0],
-                        RDS: results[1],
-                        ELB: results[2],
-                        Redshift: results[3]
-                    };
+            const iam = new AWS.IAM({region: this.config.region});
+            iam.getUser((err, response) => {
+               if(err){
+                   return this.onFatalError("Could not get user info from IAM.", err);
+               }
 
-                    fs.writeFileSync(this.config.output, JSON.stringify(savedAlarms, null, 2));
-                    this.log("Writing proposed alarms to alarms.json. Run with '--input=alarms.json' to add them.");
-                    process.exit(0);
-                })
-                .catch(err => {
-                    this.onFatalError("Error generating alarms.", err);
-                });
+               const re = new RegExp('::(\\d+):');
+               const results = re.exec(response.User.Arn);
+
+               if(!results || results.length == 0){
+                   return this.onFatalError("Could not find account id: " + response.User.Arn, null);
+               }
+
+               this.accountId = results[1];
+               this.log("AWS Account ID: " + this.accountId);
+
+               this.generateAlarms()
+                   .then(() => {
+                       process.exit(0);
+                   })
+                   .catch(() => {
+                       process.exit(-1);
+                   });
+            });
 
         } else if (this.config.action == "addAlarmsFromFile") {
             if (!this.config.input || this.config.input.length == 0) {
@@ -111,8 +108,39 @@ class Main {
 
     }
 
-    private onNever(o : never) : void {
-        this.onFatalError("Unrecognized: " + o, "");
+    private generateAlarms() : Promise<boolean> {
+        return new Promise<boolean>((resolve, reject) => {
+            Bluebird.mapSeries(SavedAlarm.getAvailableServices(), f => {
+                switch (f) {
+                    case "EC2":
+                        return this.getEc2Alarms();
+                    case "RDS":
+                        return this.getRdsAlarms();
+                    case "ELB":
+                        return this.getELBAlarms();
+                    case "Redshift":
+                        return this.getRedshiftAlarms();
+                    default:
+                        throw "Unimplemented service: " + f;
+                }
+            })
+            .then((results) => {
+                const savedAlarms: CloudWatchAlarmSet = {
+                    EC2: results[0],
+                    RDS: results[1],
+                    ELB: results[2],
+                    Redshift: results[3]
+                };
+
+                fs.writeFileSync(this.config.output, JSON.stringify(savedAlarms, null, 2));
+                this.log("Writing proposed alarms to alarms.json. Run with '--input=alarms.json' to add them.");
+                resolve(true);
+            })
+            .catch(err => {
+                this.onFatalError("Error generating alarms.", err);
+                reject(err);
+            });
+        });
     }
 
     private processSavedAlarms(savedAlarms: CloudWatchAlarmSet): void {
@@ -170,13 +198,9 @@ class Main {
                     });
                 }else if(f == "Redshift"){
                     this.applyCloudWatchAlarms(alarms).then(() => {
-                        const tagParams = {
-                            ResourceName: <string[]> taggableIdOrArns,
-                            Tags: this.getCloudWatchTag()
-                        };
-
-                        // TODO: Need to tag the Redshift cluster here
-                        
+                        Bluebird.each(taggableIdOrArns, arn => this.tagRedshift(<string> arn))
+                            .then(() => resolve(true))
+                            .catch(err => reject(err));
                     });
                 }else{
                     this.onNever(f);
@@ -193,6 +217,19 @@ class Main {
 
     }
 
+    private tagRedshift(arn : string) : Promise<boolean> {
+        return new Promise<boolean>((resolve, reject) => {
+            const tagParams = {ResourceName: arn, Tags: this.getCloudWatchTag()};
+            this.redshift.createTags(tagParams, (err, results) => {
+                if(err){
+                    return reject(err);
+                }
+
+                resolve(true);
+            });
+        });
+    }
+
     private getRedshiftAlarms() : Promise<SavedAlarm[]> {
 
         return new Promise<SavedAlarm[]>((resolve, reject) => {
@@ -202,7 +239,8 @@ class Main {
                         throw "Missing cluster identifier.";
                     }
 
-                    return new SavedAlarm(f.ClusterIdentifier, this.getRedshiftAlarmsForCluster(f));
+                    const arn = "arn:aws:redshift:" + this.config.region + ":" + this.accountId + ":cluster:" + f.ClusterIdentifier;
+                    return new SavedAlarm(arn, this.getRedshiftAlarmsForCluster(f));
                 });
                 resolve([]);
             })
@@ -858,6 +896,10 @@ class Main {
 
     private log(msg : string) : void {
         console.log(colors.gray(moment().toISOString()) + ": " + msg);
+    }
+
+    private onNever(o : never) : void {
+        this.onFatalError("Unrecognized: " + o, "");
     }
 
     private onFatalError(msg : string, error : any) : void {
