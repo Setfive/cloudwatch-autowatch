@@ -4,20 +4,20 @@ export class Config {
 
     public readonly region : string;
     public readonly notificationArn : string;
-    public readonly generateAlarms : boolean;
     public readonly input : string;
     public readonly output : string;
     public readonly action : AutowatchAction;
     public readonly help : boolean;
+    public readonly addImmediately : boolean;
 
     public static getConfig() : Config {
         const argvs = process.argv.slice(2);
         if(argvs.length == 0){
-            return {help: true, generateAlarms : false, action: "",
+            return {help: true, addImmediately: false, action: "",
                     region: "", notificationArn: "", input: "", output: ""};
         }
 
-        const argv = require("minimist")(argvs, {"boolean": ["help", "generateAlarms"], "default": {"region": "us-east-1", "output": "alarms.json"}});
+        const argv = require("minimist")(argvs, {"boolean": ["help", "addImmediately"], "default": {"region": "us-east-1", "output": "alarms.json"}});
 
         return <Config> argv;
     }
@@ -41,10 +41,11 @@ Pass any one of these as an argument to --action. Ex. --action=generateAlarms
     help:                       Prints this message
     
 Options:
-    --notificationArn       The SNS topic ARN to use for notifications. Use with 'generateAlarms'
-    --output                The JSON file to output alarms to. Use with 'generateAlarms'
-    --input                 The JSON file to add alarms from. Use with 'addAlarmsFromFile'    
-    --region                The AWS region to access. Defaults to us-east-1                      
+    --notificationArn           The SNS topic ARN to use for notifications. Use with 'generateAlarms'
+    --output                    The JSON file to output alarms to. Use with 'generateAlarms'
+    --addImmediately            Set if you want to just add alarms immediately. Use with 'generateAlarms'
+    --input                     The JSON file to add alarms from. Use with 'addAlarmsFromFile'    
+    --region                    The AWS region to access. Defaults to us-east-1                      
         
 Examples:
     # This will create a file named alarms.json

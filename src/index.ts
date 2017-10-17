@@ -61,8 +61,13 @@ class Main {
                this.log("AWS Account ID: " + this.accountId);
 
                this.generateAlarms()
-                   .then(() => {
-                       process.exit(0);
+                   .then((savedAlarms) => {
+                       if(this.config.addImmediately){
+                           this.log("Applying immediately as requested.");
+                           this.processSavedAlarms(savedAlarms);
+                       }else {
+                           process.exit(0);
+                       }
                    })
                    .catch(() => {
                        process.exit(-1);
@@ -108,8 +113,8 @@ class Main {
 
     }
 
-    private generateAlarms() : Promise<boolean> {
-        return new Promise<boolean>((resolve, reject) => {
+    private generateAlarms() : Promise<CloudWatchAlarmSet> {
+        return new Promise<CloudWatchAlarmSet>((resolve, reject) => {
             Bluebird.mapSeries(SavedAlarm.getAvailableServices(), f => {
                 switch (f) {
                     case "EC2":
@@ -132,9 +137,12 @@ class Main {
                     Redshift: results[3]
                 };
 
-                fs.writeFileSync(this.config.output, JSON.stringify(savedAlarms, null, 2));
-                this.log("Writing proposed alarms to alarms.json. Run with '--input=alarms.json' to add them.");
-                resolve(true);
+                if(!this.config.addImmediately) {
+                    fs.writeFileSync(this.config.output, JSON.stringify(savedAlarms, null, 2));
+                    this.log("Writing proposed alarms to alarms.json. Run with '--input=alarms.json' to add them.");
+                }
+
+                resolve(savedAlarms);
             })
             .catch(err => {
                 this.onFatalError("Error generating alarms.", err);
