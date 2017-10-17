@@ -72,3 +72,18 @@ And that's about it!
 
 ### Anything else?
 
+Another usecase would be to help monitor EC2s in autoscaling groups that are 
+continually being cycled in and out. It would be pretty straightforward to 
+orchestrate this to run on a cron job and have it automatically add alarms 
+to new EC2 instances as they're started.
+
+To add alarms immediately just set the 'addImmediately' option along 
+with 'generateAlarms'
+
+```
+ashish@ashish:~/workspace/cloudwatch-auto$ ./index.js --action=generateAlarms --notificationArn=[your arn] --addImmediately=true
+```
+
+And lastly, this project is actually written in TypeScript as opposed 
+to regular JavaScript as an experiment in writing tools in TypeScript. 
+Overall, it was a pretty good experience and I would recommend.
