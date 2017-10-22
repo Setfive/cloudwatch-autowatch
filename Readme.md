@@ -1,6 +1,4 @@
-<p align="center">
 ![Logo](/misc/logo.png?raw=true)
-</p>
 
 ## Cloudwatch Autowatch
 
