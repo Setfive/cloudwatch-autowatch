@@ -1,4 +1,6 @@
-![Logo](/misc/logo.png?raw=true)
+<p align="center">
+<img src="/misc/logo.png?raw=true" />
+</p>
 
 ## Cloudwatch Autowatch
 
