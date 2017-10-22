@@ -1,3 +1,7 @@
+<p align="center">
+![Logo](/misc/logo.png?raw=true)
+</p>
+
 ## Cloudwatch Autowatch
 
 Amazon's CloudWatch product is great but it's a bit tedious to manually 
