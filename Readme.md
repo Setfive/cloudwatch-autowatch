@@ -89,3 +89,38 @@ ashish@ashish:~/workspace/cloudwatch-auto$ ./index.js --action=generateAlarms --
 And lastly, this project is actually written in TypeScript as opposed 
 to regular JavaScript as an experiment in writing tools in TypeScript. 
 Overall, it was a pretty good experience and I would recommend.
+
+### Usage
+
+```
+Usage cloudwatch-auto [options]
+ 
+cloudwatch-auto automatically adds baseline alarms to your AWS resources. 
+These alarms are intended to serve only as a starting point, mostly useful when you're just starting out with AWS.
+ 
+Note: The AWS client authenticates automatically using IAM roles, environment variables, or a JSON credential file.
+      One of these must be available in order for cloudwatch-auto to work.  
+ 
+
+Action Flags:
+Pass any one of these as an argument to --action. Ex. --action=generateAlarms
+
+    generateAlarms:             Generates a file based on AWS resources. The file is alarms.json by default.   
+    addAlarmsFromFile:          Add alarms from a JSON file specified by --input (see below)
+    listSnsTopics:              Lists the available SNS topics
+    help:                       Prints this message
+    
+Options:
+    --notificationArn       The SNS topic ARN to use for notifications. Use with 'generateAlarms'
+    --output                The JSON file to output alarms to. Use with 'generateAlarms'
+    --input                 The JSON file to add alarms from. Use with 'addAlarmsFromFile'    
+    --region                The AWS region to access. Defaults to us-east-1                      
+        
+Examples:
+    # This will create a file named alarms.json
+    cloudwatch-auto --action=generateAlarms --notificationArn=arn:aws:sns:us-east-1:123:ContactAndCloudWatch
+    
+    # Now, create the alarms contained inside alarms.json. You can edit the alarms before adding them.
+    cloudwatch-auto --action=addAlarmsFromFile --input=alarms.json               
+    
+```
