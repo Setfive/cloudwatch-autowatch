@@ -29,17 +29,12 @@ class Main {
             if (!this.config.notificationArn || this.config.notificationArn.length == 0) {
                 this.onFatalError("You must specify a notificationArn option for where to receive alerts.", "");
             }
-            const iam = new AWS.IAM({ region: this.config.region });
-            iam.getUser((err, response) => {
-                if (err) {
-                    return this.onFatalError("Could not get user info from IAM.", err);
+            const sts = new AWS.STS({ region: this.config.region });
+            sts.getCallerIdentity({}, (err, response) => {
+                if (err || !response.Account) {
+                    return this.onFatalError("Could not get user info from STS.", err);
                 }
-                const re = new RegExp('::(\\d+):');
-                const results = re.exec(response.User.Arn);
-                if (!results || results.length == 0) {
-                    return this.onFatalError("Could not find account id: " + response.User.Arn, null);
-                }
-                this.accountId = results[1];
+                this.accountId = response.Account;
                 this.log("AWS Account ID: " + this.accountId);
                 this.generateAlarms()
                     .then((savedAlarms) => {
